@@ -86,7 +86,13 @@ async def get_worker() -> "Worker":
 
 
 def format_prompt(messages):
-    return "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+    parts = []
+    for m in messages:
+        content = m.get("content") or ""
+        if isinstance(content, list):
+            content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+        parts.append(f"{m['role']}: {content}")
+    return "\n".join(parts)
 
 
 @app.on_event("startup")
