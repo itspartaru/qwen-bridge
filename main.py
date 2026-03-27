@@ -1,6 +1,13 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
-import asyncio, time, uuid, json
+import asyncio, time, uuid, json, logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("qwen-bridge")
 
 app = FastAPI()
 POOL_SIZE = 3
@@ -8,7 +15,8 @@ workers: list["Worker"] = []
 
 
 class Worker:
-    def __init__(self):
+    def __init__(self, wid: int):
+        self.wid = wid
         self.process = None
         self.lock = asyncio.Lock()
 
@@ -22,10 +30,10 @@ class Worker:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        # Процесс ждёт ввода — system/init придёт с первым сообщением
+        log.info(f"[worker-{self.wid}] started (pid={self.process.pid})")
 
     async def generate(self, text: str):
-        """Генератор (delta, is_done, usage). Держит lock на время запроса."""
+        """Генератор (delta, is_done, usage)."""
         msg = json.dumps({
             "type": "user",
             "message": {"role": "user", "content": [{"type": "text", "text": text}]}
@@ -46,7 +54,7 @@ class Worker:
             t = data.get("type")
 
             if t == "system":
-                continue  # повторный init между запросами — пропускаем
+                continue
 
             elif t == "assistant":
                 for block in data.get("message", {}).get("content", []):
@@ -65,6 +73,7 @@ class Worker:
         return self.process is not None and self.process.returncode is None
 
     async def restart(self):
+        log.warning(f"[worker-{self.wid}] dead, restarting...")
         try:
             self.process.kill()
         except Exception:
@@ -73,7 +82,6 @@ class Worker:
 
 
 async def get_worker() -> "Worker":
-    """Ждёт свободного воркера, при необходимости перезапускает упавший."""
     while True:
         for w in workers:
             if w.lock.locked():
@@ -95,12 +103,31 @@ def format_prompt(messages):
     return "\n".join(parts)
 
 
+def log_request(rid: str, messages: list, do_stream: bool):
+    last = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    preview = ""
+    if last:
+        c = last.get("content") or ""
+        if isinstance(c, list):
+            c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+        preview = c[:120].replace("\n", " ")
+    log.info(f"[{rid}] ▶ stream={do_stream} msgs={len(messages)} | user: {preview!r}")
+
+
+def log_response(rid: str, output: str, usage: dict, elapsed: float):
+    preview = output[:120].replace("\n", " ")
+    tokens = f"in={usage.get('input_tokens','?')} out={usage.get('output_tokens','?')} total={usage.get('total_tokens','?')}"
+    log.info(f"[{rid}] ✓ {elapsed:.2f}s {tokens} | reply: {preview!r}")
+
+
 @app.on_event("startup")
 async def startup():
-    for _ in range(POOL_SIZE):
-        w = Worker()
+    log.info(f"Starting {POOL_SIZE} workers...")
+    for i in range(POOL_SIZE):
+        w = Worker(wid=i)
         await w.start()
         workers.append(w)
+    log.info("All workers ready")
 
 
 @app.post("/v1/chat/completions")
@@ -110,16 +137,26 @@ async def chat(request: Request):
     do_stream = body.get("stream", False)
     prompt = format_prompt(messages)
 
-    request_id = f"chatcmpl-{uuid.uuid4().hex}"
+    request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     created = int(time.time())
 
+    log_request(request_id, messages, do_stream)
+    t_start = time.monotonic()
+
     worker = await get_worker()
+    log.info(f"[{request_id}] → worker-{worker.wid}")
 
     if do_stream:
         async def event_stream():
+            output = ""
+            usage = {}
+            first_token = None
             async with worker.lock:
-                async for delta, done, usage in worker.generate(prompt):
+                async for delta, done, u in worker.generate(prompt):
                     if done:
+                        usage = u
+                        elapsed = time.monotonic() - t_start
+                        log_response(request_id, output, usage, elapsed)
                         payload = {
                             "id": request_id, "object": "chat.completion.chunk",
                             "created": created, "model": "qwen-cli",
@@ -128,6 +165,10 @@ async def chat(request: Request):
                         yield f"data: {json.dumps(payload)}\n\n"
                         yield "data: [DONE]\n\n"
                     elif delta:
+                        if first_token is None:
+                            first_token = time.monotonic() - t_start
+                            log.info(f"[{request_id}] first token in {first_token:.2f}s")
+                        output += delta
                         payload = {
                             "id": request_id, "object": "chat.completion.chunk",
                             "created": created, "model": "qwen-cli",
@@ -146,6 +187,9 @@ async def chat(request: Request):
                     usage = u
                 else:
                     output += delta
+
+        elapsed = time.monotonic() - t_start
+        log_response(request_id, output, usage, elapsed)
 
         return JSONResponse({
             "id": request_id,
