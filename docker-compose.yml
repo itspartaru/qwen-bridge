@@ -1,0 +1,10 @@
+services:
+  qwen-bridge:
+    image: itsparta/qwen-bridge:latest
+    container_name: qwen-bridge
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./docker-config:/root/.config
+      - ./docker-qwen:/root/.qwen
+    restart: unless-stopped
