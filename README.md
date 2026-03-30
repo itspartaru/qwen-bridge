@@ -25,15 +25,25 @@ docker run -d \
 
 Or with Docker Compose — see [docker-compose.yml](docker-compose.yml).
 
-### 2. Authorize Qwen
+### 2. Authorize Qwen (first time)
+
+Run an interactive shell inside the container:
 
 ```bash
 docker exec -it qwen-bridge bash
 source /root/.nvm/nvm.sh
-qwen auth login
+qwen auth qwen-oauth
 ```
 
-Auth is persisted via the mounted `/root/.qwen` volume — survives container restarts.
+The CLI will print (or open interactive) a URL — open it in a browser to complete OAuth. Once done, exit the shell:
+
+```bash
+exit
+```
+
+Auth tokens are stored in `/root/.qwen` inside the container, which is persisted via the mounted volume. You only need to do this once — it survives container restarts and image updates as long as the volume path stays the same.
+
+> **Tip:** If the container isn't running yet (e.g. auth fails on startup), start it first without the worker pool: `docker compose run --rm qwen-bridge bash`, authorize, then `docker compose up -d`.
 
 ### 3. Test
 
