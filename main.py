@@ -10,7 +10,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "0.95.3"
+VERSION = "0.95.4"
 
 app = FastAPI()
 POOL_SIZE = 3
