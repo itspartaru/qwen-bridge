@@ -9,6 +9,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
+VERSION = "0.95.1"
+
 app = FastAPI()
 POOL_SIZE = 3
 workers: list["Worker"] = []
@@ -42,6 +44,7 @@ class Worker:
         await self.process.stdin.drain()
 
         sent_len = 0
+        usage_buf = {}
         try:
             while True:
                 try:
@@ -68,16 +71,22 @@ class Worker:
 
                 if t == "system":
                     continue
+                elif t == "stream_event":
+                    event = data.get("event", {})
+                    et = event.get("type")
+                    if et == "content_block_delta":
+                        delta_obj = event.get("delta", {})
+                        if delta_obj.get("type") == "text_delta":
+                            text = delta_obj.get("text", "")
+                            if text:
+                                yield text, False, {}
                 elif t == "assistant":
-                    for block in data.get("message", {}).get("content", []):
-                        if block.get("type") == "text":
-                            full = block["text"]
-                            delta = full[sent_len:]
-                            if delta:
-                                sent_len = len(full)
-                                yield delta, False, {}
+                    # последнее assistant-сообщение содержит финальный usage
+                    last_usage = data.get("message", {}).get("usage", {})
+                    if last_usage:
+                        usage_buf = last_usage
                 elif t == "result":
-                    yield "", True, data.get("usage", {})
+                    yield "", True, data.get("usage", usage_buf)
                     return
         except asyncio.CancelledError:
             # Клиент отключился — убиваем процесс чтобы не оставлять мусор в stdout
@@ -141,7 +150,7 @@ def log_response(rid: str, output: str, usage: dict, elapsed: float):
 
 @app.on_event("startup")
 async def startup():
-    log.info(f"Starting {POOL_SIZE} workers...")
+    log.info(f"qwen-bridge v{VERSION} starting, pool={POOL_SIZE} workers")
     for i in range(POOL_SIZE):
         w = Worker(wid=i)
         await w.start()
