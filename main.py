@@ -32,8 +32,8 @@ class Worker:
         )
         log.info(f"[worker-{self.wid}] started (pid={self.process.pid})")
 
-    async def generate(self, text: str):
-        """Генератор (delta, is_done, usage)."""
+    async def generate(self, text: str, token_timeout: float = 120.0):
+        """Генератор (delta, is_done, usage). token_timeout — таймаут между токенами."""
         msg = json.dumps({
             "type": "user",
             "message": {"role": "user", "content": [{"type": "text", "text": text}]}
@@ -42,32 +42,51 @@ class Worker:
         await self.process.stdin.drain()
 
         sent_len = 0
-        while True:
-            line = await self.process.stdout.readline()
-            if not line:
-                yield "", True, {}
-                return
-            raw = line.decode().strip()
-            if not raw:
-                continue
-            data = json.loads(raw)
-            t = data.get("type")
+        try:
+            while True:
+                try:
+                    line = await asyncio.wait_for(
+                        self.process.stdout.readline(),
+                        timeout=token_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(f"[worker-{self.wid}] readline timeout after {token_timeout}s, killing process")
+                    try:
+                        self.process.kill()
+                    except Exception:
+                        pass
+                    yield "", True, {}
+                    return
+                if not line:
+                    yield "", True, {}
+                    return
+                raw = line.decode().strip()
+                if not raw:
+                    continue
+                data = json.loads(raw)
+                t = data.get("type")
 
-            if t == "system":
-                continue
-
-            elif t == "assistant":
-                for block in data.get("message", {}).get("content", []):
-                    if block.get("type") == "text":
-                        full = block["text"]
-                        delta = full[sent_len:]
-                        if delta:
-                            sent_len = len(full)
-                            yield delta, False, {}
-
-            elif t == "result":
-                yield "", True, data.get("usage", {})
-                return
+                if t == "system":
+                    continue
+                elif t == "assistant":
+                    for block in data.get("message", {}).get("content", []):
+                        if block.get("type") == "text":
+                            full = block["text"]
+                            delta = full[sent_len:]
+                            if delta:
+                                sent_len = len(full)
+                                yield delta, False, {}
+                elif t == "result":
+                    yield "", True, data.get("usage", {})
+                    return
+        except asyncio.CancelledError:
+            # Клиент отключился — убиваем процесс чтобы не оставлять мусор в stdout
+            log.warning(f"[worker-{self.wid}] client disconnected, killing process")
+            try:
+                self.process.kill()
+            except Exception:
+                pass
+            raise
 
     async def is_alive(self) -> bool:
         return self.process is not None and self.process.returncode is None
