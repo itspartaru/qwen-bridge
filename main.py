@@ -9,7 +9,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "1.0.0rc"
+VERSION = "1.0.0rc2"
 
 # ─── Tool mapping: Qwen Code ↔ pi-agent-core ─────────────────────────────────
 #
@@ -87,6 +87,7 @@ class Worker:
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--include-partial-messages",
+            "--exclude-tools", "skill",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -229,7 +230,7 @@ class Session:
             if not raw:
                 continue
 
-            log.debug(f"[worker-{self.worker.wid}] ← {raw[:300]}")
+            log.debug(f"[worker-{self.worker.wid}] ← {raw}")
             data = json.loads(raw)
             t = data.get("type")
 
@@ -404,6 +405,7 @@ async def _iter_session(session: Session, request_id: str, created: int):
     t_start = time.monotonic()
     first_token: float | None = None
     output = ""
+    handed_off = False  # True when we paused for tool_calls — session stays live
 
     try:
         while True:
@@ -460,6 +462,7 @@ async def _iter_session(session: Session, request_id: str, created: int):
                     "choices": [{"delta": {}, "index": 0, "finish_reason": "tool_calls"}],
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
+                handed_off = True
                 yield "data: [DONE]\n\n"
                 return  # pi-agent-core sends next request with tool results
 
@@ -478,9 +481,10 @@ async def _iter_session(session: Session, request_id: str, created: int):
                 return
 
     finally:
-        if session.task and not session.task.done():
-            session.task.cancel()
-        session._unregister()
+        if not handed_off:
+            if session.task and not session.task.done():
+                session.task.cancel()
+            session._unregister()
 
 
 # ─── HTTP handler ─────────────────────────────────────────────────────────────
