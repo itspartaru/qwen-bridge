@@ -110,12 +110,12 @@ def log_request(rid: str, messages: list, do_stream: bool):
         c = last.get("content") or ""
         if isinstance(c, list):
             c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
-        preview = c[:120].replace("\n", " ")
+        preview = c.replace("\n", " ")
     log.info(f"[{rid}] ▶ stream={do_stream} msgs={len(messages)} | user: {preview!r}")
 
 
 def log_response(rid: str, output: str, usage: dict, elapsed: float):
-    preview = output[:120].replace("\n", " ")
+    preview = output.replace("\n", " ")
     tokens = f"in={usage.get('input_tokens','?')} out={usage.get('output_tokens','?')} total={usage.get('total_tokens','?')}"
     log.info(f"[{rid}] ✓ {elapsed:.2f}s {tokens} | reply: {preview!r}")
 
