@@ -9,7 +9,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # ─── Tool mapping: Qwen Code ↔ pi-agent-core ─────────────────────────────────
 #
@@ -162,10 +162,14 @@ class Session:
 
                         try:
                             tool_results = await asyncio.wait_for(
-                                self.tool_q.get(), timeout=300.0
+                                self.tool_q.get(), timeout=120.0
                             )
                         except asyncio.TimeoutError:
-                            log.warning(f"[session-{self.session_id[:8]}] tool result timeout")
+                            log.warning(f"[session-{self.session_id[:8]}] tool result timeout, killing worker")
+                            try:
+                                self.worker.process.kill()
+                            except Exception:
+                                pass
                             await self.out_q.put({"type": "done", "usage": {}})
                             return
                         finally:
@@ -385,6 +389,8 @@ def extract_tool_results(messages: list) -> list:
 
 def _fmt(text: str, limit: int) -> str:
     text = text.replace("\n", " ")
+    if log.isEnabledFor(logging.DEBUG):
+        return text
     return text if len(text) <= limit else text[:limit] + "…"
 
 
