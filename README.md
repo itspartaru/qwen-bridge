@@ -64,6 +64,18 @@ services:
     restart: unless-stopped
 ```
 
+## Logging
+
+Controlled by the `LOG_LEVEL` environment variable:
+
+| `LOG_LEVEL`         | Behavior                                                     |
+|---------------------|--------------------------------------------------------------|
+| `WARNING` (default) | request preview (120 chars) + response preview (200 chars)   |
+| `INFO`              | full request and response text                               |
+| `DEBUG`             | full text + every streaming chunk                            |
+
+Set in `docker-compose.yml` or via `docker run -e LOG_LEVEL=DEBUG ...`.
+
 ## How it works
 
 On startup, the bridge pre-launches 3 persistent Qwen CLI processes using `--input-format stream-json`. Each request acquires a free worker via `asyncio.Lock`, sends the message over stdin, and streams the response back. Workers are automatically restarted on failure.

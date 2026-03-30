@@ -2,6 +2,12 @@ services:
   qwen-bridge:
     image: itsparta/qwen-bridge:latest
     container_name: qwen-bridge
+    environment:
+      # Уровень логирования:
+      #   не задан / WARNING — короткий превью запроса (120 симв.) и ответа (200 симв.)
+      #   INFO — полный текст запросов и ответов
+      #   DEBUG — полный текст + каждый streaming-чанк
+      - LOG_LEVEL=WARNING
     ports:
       - "5000:5000"
     volumes:

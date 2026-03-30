@@ -2,14 +2,15 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import asyncio, time, uuid, json, logging
 
+import os
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.getenv("LOG_LEVEL", "WARNING").upper(), logging.WARNING),
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "0.95.1"
+VERSION = "0.95.2"
 
 app = FastAPI()
 POOL_SIZE = 3
@@ -131,26 +132,40 @@ def format_prompt(messages):
     return "\n".join(parts)
 
 
+def _fmt(text: str, limit: int) -> str:
+    text = text.replace("\n", " ")
+    if log.isEnabledFor(logging.INFO):
+        return text
+    return text[:limit] + "…" if len(text) > limit else text
+
+
 def log_request(rid: str, messages: list, do_stream: bool):
     last = next((m for m in reversed(messages) if m.get("role") == "user"), None)
-    preview = ""
+    text = ""
     if last:
         c = last.get("content") or ""
         if isinstance(c, list):
             c = " ".join(b.get("text", "") for b in c if isinstance(b, dict))
-        preview = c.replace("\n", " ")
-    log.info(f"[{rid}] ▶ stream={do_stream} msgs={len(messages)} | user: {preview!r}")
+        text = c
+    msg = f"[{rid}] ▶ stream={do_stream} msgs={len(messages)} | user: {_fmt(text, 120)!r}"
+    if log.isEnabledFor(logging.INFO):
+        log.info(msg)
+    else:
+        log.warning(msg)
 
 
 def log_response(rid: str, output: str, usage: dict, elapsed: float):
-    preview = output.replace("\n", " ")
     tokens = f"in={usage.get('input_tokens','?')} out={usage.get('output_tokens','?')} total={usage.get('total_tokens','?')}"
-    log.info(f"[{rid}] ✓ {elapsed:.2f}s {tokens} | reply: {preview!r}")
+    msg = f"[{rid}] ✓ {elapsed:.2f}s {tokens} | reply: {_fmt(output, 200)!r}"
+    if log.isEnabledFor(logging.INFO):
+        log.info(msg)
+    else:
+        log.warning(msg)
 
 
 @app.on_event("startup")
 async def startup():
-    log.info(f"qwen-bridge v{VERSION} starting, pool={POOL_SIZE} workers")
+    log.warning(f"qwen-bridge v{VERSION} starting, pool={POOL_SIZE} workers")
     for i in range(POOL_SIZE):
         w = Worker(wid=i)
         await w.start()
@@ -197,6 +212,7 @@ async def chat(request: Request):
                             first_token = time.monotonic() - t_start
                             log.info(f"[{request_id}] first token in {first_token:.2f}s")
                         output += delta
+                        log.debug(f"[{request_id}] ▸ {delta!r}")
                         payload = {
                             "id": request_id, "object": "chat.completion.chunk",
                             "created": created, "model": "qwen-cli",
