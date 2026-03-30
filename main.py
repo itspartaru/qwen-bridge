@@ -10,7 +10,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "0.95.4"
+VERSION = "0.95.5"
+
+# Инструменты которые недоступны в bridge-режиме и почему
+TOOL_STUBS = {
+    # Файловая система контейнера недоступна снаружи
+    "read_file":       "Tool unavailable in bridge mode: filesystem is not accessible",
+    "write_file":      "Tool unavailable in bridge mode: filesystem is not accessible",
+    "edit":            "Tool unavailable in bridge mode: filesystem is not accessible",
+    "list_directory":  "Tool unavailable in bridge mode: filesystem is not accessible",
+    "glob":            "Tool unavailable in bridge mode: filesystem is not accessible",
+    "grep_search":     "Tool unavailable in bridge mode: filesystem is not accessible",
+    # Опасно / не имеет смысла
+    "run_shell_command": "Tool unavailable in bridge mode: shell execution is disabled",
+    "agent":           "Tool unavailable in bridge mode",
+    "skill":           "Tool unavailable in bridge mode",
+    # Интерактивные — сломают поток
+    "ask_user_question": "Tool unavailable in bridge mode: interactive tools are disabled",
+    "exit_plan_mode":  "Tool unavailable in bridge mode: interactive tools are disabled",
+    # Память — пишет в контейнер, не персистентна
+    "save_memory":     "Tool unavailable in bridge mode: memory storage is not persistent",
+    "todo_write":      "Tool unavailable in bridge mode",
+}
 
 app = FastAPI()
 POOL_SIZE = 3
@@ -29,10 +50,6 @@ class Worker:
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--include-partial-messages",
-            "--exclude-tools", "agent", "skill", "list_directory", "read_file",
-            "grep_search", "glob", "edit", "write_file", "run_shell_command",
-            "save_memory", "todo_write", "ask_user_question", "exit_plan_mode",
-            "web_fetch", "web_search",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -50,6 +67,7 @@ class Worker:
 
         sent_len = 0
         usage_buf = {}
+        pending_tool_ids: list[tuple[str, str]] = []  # (tool_use_id, tool_name)
         try:
             while True:
                 try:
@@ -98,9 +116,33 @@ class Worker:
                             text = delta_obj.get("text", "")
                             if text:
                                 yield text, False, {}
+                    elif et == "message_stop" and pending_tool_ids:
+                        # qwen ждёт результаты tool calls — отвечаем заглушкой для заблокированных
+                        tool_results = [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tid,
+                                "content": TOOL_STUBS.get(name, "Tool result unavailable"),
+                                "is_error": True,
+                            }
+                            for tid, name in pending_tool_ids
+                        ]
+                        stub = json.dumps({
+                            "type": "user",
+                            "message": {"role": "user", "content": tool_results}
+                        }) + "\n"
+                        names = [n for _, n in pending_tool_ids]
+                        log.debug(f"[worker-{self.wid}] stub results for: {names}")
+                        self.process.stdin.write(stub.encode())
+                        await self.process.stdin.drain()
+                        pending_tool_ids.clear()
                 elif t == "assistant":
-                    # последнее assistant-сообщение содержит финальный usage
-                    last_usage = data.get("message", {}).get("usage", {})
+                    msg = data.get("message", {})
+                    for block in msg.get("content", []):
+                        if block.get("type") == "tool_use":
+                            pending_tool_ids.append((block["id"], block["name"]))
+                            log.debug(f"[worker-{self.wid}] tool_use: {block['name']}({block['id']})")
+                    last_usage = msg.get("usage", {})
                     if last_usage:
                         usage_buf = last_usage
                 elif t == "result":
