@@ -10,7 +10,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "0.95.2"
+VERSION = "0.95.3"
 
 app = FastAPI()
 POOL_SIZE = 3
@@ -54,7 +54,19 @@ class Worker:
                         timeout=token_timeout,
                     )
                 except asyncio.TimeoutError:
-                    log.warning(f"[worker-{self.wid}] readline timeout after {token_timeout}s, killing process")
+                    # Читаем stderr чтобы понять что происходило
+                    stderr_out = ""
+                    try:
+                        stderr_out = await asyncio.wait_for(
+                            self.process.stderr.read(4096), timeout=1.0
+                        )
+                        stderr_out = stderr_out.decode(errors="replace").strip()
+                    except Exception:
+                        pass
+                    log.warning(
+                        f"[worker-{self.wid}] readline timeout after {token_timeout}s, killing process"
+                        + (f" | stderr: {stderr_out[:500]}" if stderr_out else "")
+                    )
                     try:
                         self.process.kill()
                     except Exception:
@@ -67,6 +79,7 @@ class Worker:
                 raw = line.decode().strip()
                 if not raw:
                     continue
+                log.debug(f"[worker-{self.wid}] ← {raw[:300]}")
                 data = json.loads(raw)
                 t = data.get("type")
 
