@@ -9,7 +9,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
+CONTEXT_MESSAGES_LIMIT = int(os.getenv("CONTEXT_MESSAGES_LIMIT", "20"))
 
 # ─── Tool mapping: Qwen Code ↔ pi-agent-core ─────────────────────────────────
 #
@@ -514,7 +515,7 @@ async def _iter_session(session: Session, request_id: str, created: int):
 
 @app.on_event("startup")
 async def startup():
-    log.warning(f"qwen-bridge v{VERSION} starting, pool={POOL_SIZE} workers")
+    log.warning(f"qwen-bridge v{VERSION} starting, pool={POOL_SIZE} workers, CONTEXT_MESSAGES_LIMIT = {CONTEXT_MESSAGES_LIMIT}")
     for i in range(POOL_SIZE):
         w = Worker(wid=i)
         await w.start()
