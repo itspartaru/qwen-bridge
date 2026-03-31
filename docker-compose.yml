@@ -9,6 +9,9 @@ services:
       #   INFO — полный текст запросов и ответов
       #   DEBUG — полный текст + каждый streaming-чанк
       - LOG_LEVEL=WARNING
+      # Sliding window: max non-system messages passed to Qwen Code per request.
+      # Reduces token usage for long conversations. 0 = no limit.
+      - CONTEXT_MESSAGES_LIMIT=20
     ports:
       - "5000:5000"
     volumes:

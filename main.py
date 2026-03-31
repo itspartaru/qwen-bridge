@@ -9,7 +9,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 # ─── Tool mapping: Qwen Code ↔ pi-agent-core ─────────────────────────────────
 #
@@ -162,7 +162,7 @@ class Session:
 
                         try:
                             tool_results = await asyncio.wait_for(
-                                self.tool_q.get(), timeout=120.0
+                                self.tool_q.get(), timeout=600.0
                             )
                         except asyncio.TimeoutError:
                             log.warning(f"[session-{self.session_id[:8]}] tool result timeout, killing worker")
@@ -346,7 +346,14 @@ def format_prompt(messages: list, tools: list | None = None) -> str:
             lines.append(f"  {name}{params_str} — {desc}")
         parts.append("\n".join(lines))
 
-    for m in messages:
+    # Sliding window: always keep system messages; limit non-system messages to last N
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    other_msgs  = [m for m in messages if m.get("role") != "system"]
+    if CONTEXT_MESSAGES_LIMIT > 0:
+        other_msgs = other_msgs[-CONTEXT_MESSAGES_LIMIT:]
+    windowed = system_msgs + other_msgs
+
+    for m in windowed:
         role = m.get("role", "")
         content = m.get("content") or ""
         if isinstance(content, list):
