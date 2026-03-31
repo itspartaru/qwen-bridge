@@ -9,7 +9,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 # ─── Tool mapping: Qwen Code ↔ pi-agent-core ─────────────────────────────────
 #
@@ -351,8 +351,17 @@ def format_prompt(messages: list, tools: list | None = None) -> str:
         content = m.get("content") or ""
         if isinstance(content, list):
             content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+
         if role == "tool":
             parts.append(f"tool_result [{m.get('tool_call_id', '')}]: {content}")
+        elif role == "assistant" and m.get("tool_calls"):
+            # Preserve tool call context so Qwen understands why tool_results follow
+            call_strs = []
+            for tc in m["tool_calls"]:
+                fn = tc.get("function", {})
+                call_strs.append(f"{fn.get('name', '')}({fn.get('arguments', '')})")
+            suffix = f" [called: {'; '.join(call_strs)}]" if call_strs else ""
+            parts.append(f"assistant:{suffix}")
         else:
             parts.append(f"{role}: {content}")
 
@@ -360,7 +369,8 @@ def format_prompt(messages: list, tools: list | None = None) -> str:
 
 
 def find_session(messages: list) -> "Session | None":
-    for m in messages:
+    # Search from the end — most recent tool calls are at the bottom
+    for m in reversed(messages):
         if m.get("role") == "tool":
             s = active_sessions.get(m.get("tool_call_id", ""))
             if s:
