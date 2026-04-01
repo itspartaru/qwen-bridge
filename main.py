@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import asyncio, time, uuid, json, logging, os, shlex
+from typing import Callable
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "WARNING").upper(), logging.WARNING),
@@ -9,7 +10,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 CONTEXT_MESSAGES_LIMIT = int(os.getenv("CONTEXT_MESSAGES_LIMIT", "20"))
 
 # ─── Tool mapping: Qwen Code ↔ pi-agent-core ─────────────────────────────────
@@ -35,7 +36,7 @@ TOOL_ARG_MAP: dict[str, dict[str, str]] = {
 }
 
 # Qwen Code tools that have no direct equivalent — map to exec with generated command
-TOOL_TO_EXEC: dict[str, "Callable[[dict], str]"] = {
+TOOL_TO_EXEC: dict[str, Callable[[dict], str]] = {
     "list_directory": lambda i: f"ls -la {shlex.quote(i.get('path', i.get('directory', '.')))}",
     "glob":           lambda i: f"find . -name {shlex.quote(i.get('pattern', '*'))}",
     "grep_search":    lambda i: (
@@ -72,9 +73,6 @@ app = FastAPI()
 POOL_SIZE = 3
 workers: list["Worker"] = []
 
-# Active sessions keyed by tool_call_id for routing follow-up requests
-active_sessions: dict[str, "Session"] = {}
-
 
 class Worker:
     def __init__(self, wid: int):
@@ -99,7 +97,7 @@ class Worker:
         return self.process is not None and self.process.returncode is None
 
     async def restart(self):
-        log.warning(f"[worker-{self.wid}] dead, restarting...")
+        log.warning(f"[worker-{self.wid}] restarting...")
         try:
             self.process.kill()
         except Exception:
@@ -109,8 +107,12 @@ class Worker:
 
 class Session:
     """
-    One session = one qwen CLI conversation held for its full duration.
-    Holds the worker lock until the conversation ends.
+    Stateless session: one qwen CLI interaction per HTTP request.
+    Worker is always restarted at the start to ensure clean context.
+    Tool results from openclaw are NOT waited for — when qwen issues real
+    tool calls they are returned immediately and the session ends.
+    The next request will carry the full message history (including tool
+    results) which format_prompt renders into a single prompt for qwen.
 
     out_q event types:
       {"type": "text",       "text": str}
@@ -121,28 +123,15 @@ class Session:
     def __init__(self, session_id: str, worker: Worker):
         self.session_id = session_id
         self.worker = worker
-        self.out_q: asyncio.Queue = asyncio.Queue()        # qwen CLI → HTTP handler
-        self.tool_q: asyncio.Queue[list] = asyncio.Queue() # HTTP handler → qwen CLI
-        self._active_ids: set[str] = set()
-        self._pending_stubs: list[dict] = []  # stub results waiting to merge with pi-agent-core results
+        self.out_q: asyncio.Queue = asyncio.Queue()
         self.task: asyncio.Task | None = None
 
-    def _register(self, call_ids: list[str]):
-        for cid in call_ids:
-            active_sessions[cid] = self
-        self._active_ids.update(call_ids)
-
-    def _unregister(self):
-        for cid in self._active_ids:
-            active_sessions.pop(cid, None)
-        self._active_ids.clear()
-
     async def run(self, prompt: str, token_timeout: float = 120.0):
-        """Background task: drives the qwen CLI for the full conversation."""
+        """Background task: drives the qwen CLI for this request."""
         try:
             async with self.worker.lock:
-                if not await self.worker.is_alive():
-                    await self.worker.restart()
+                # Always restart — stateless mode requires a fresh qwen context
+                await self.worker.restart()
 
                 await self._send({
                     "type": "user",
@@ -151,39 +140,9 @@ class Session:
 
                 while True:
                     event = await self._read_event(token_timeout)
-
-                    if event["type"] == "done":
-                        await self.out_q.put(event)
+                    await self.out_q.put(event)
+                    if event["type"] in ("done", "tool_calls"):
                         return
-
-                    elif event["type"] == "tool_calls":
-                        calls = event["calls"]
-                        self._register([c["id"] for c in calls])
-                        await self.out_q.put(event)
-
-                        try:
-                            tool_results = await asyncio.wait_for(
-                                self.tool_q.get(), timeout=600.0
-                            )
-                        except asyncio.TimeoutError:
-                            log.warning(f"[session-{self.session_id[:8]}] tool result timeout, killing worker")
-                            try:
-                                self.worker.process.kill()
-                            except Exception:
-                                pass
-                            await self.out_q.put({"type": "done", "usage": {}})
-                            return
-                        finally:
-                            self._unregister()
-
-                        # Merge pi-agent-core results with any pre-computed stub results
-                        all_results = self._pending_stubs + tool_results
-                        self._pending_stubs = []
-
-                        await self._send({
-                            "type": "user",
-                            "message": {"role": "user", "content": all_results},
-                        })
 
         except asyncio.CancelledError:
             log.warning(f"[session-{self.session_id[:8]}] cancelled")
@@ -289,10 +248,11 @@ class Session:
                         })
                         # Continue the while loop — don't return a tool_calls event
                     else:
-                        # Real tools for pi-agent-core; stubs will be merged on return
-                        self._pending_stubs = stub_results
+                        # Real tools for pi-agent-core; session ends here.
+                        # Any stub results from this batch will be synthesized by
+                        # format_prompt when openclaw sends the next request with history.
                         names = [c["function"]["name"] for c in real_calls]
-                        log.debug(f"[worker-{self.worker.wid}] tool_calls → pi-agent-core: {names}")
+                        log.debug(f"[worker-{self.worker.wid}] tool_calls → openclaw: {names}")
                         return {"type": "tool_calls", "calls": real_calls}
 
             elif t == "assistant":
@@ -316,12 +276,8 @@ class Session:
 async def get_worker() -> Worker:
     while True:
         for w in workers:
-            if w.lock.locked():
-                continue
-            if not await w.is_alive():
-                async with w.lock:
-                    await w.restart()
-            return w
+            if not w.lock.locked():
+                return w
         await asyncio.sleep(0.01)
 
 
@@ -347,12 +303,29 @@ def format_prompt(messages: list, tools: list | None = None) -> str:
             lines.append(f"  {name}{params_str} — {desc}")
         parts.append("\n".join(lines))
 
-    # Sliding window: always keep system messages; limit non-system messages to last N
-    system_msgs = [m for m in messages if m.get("role") == "system"]
-    other_msgs  = [m for m in messages if m.get("role") != "system"]
+    # Deduplicate system messages by content (openclaw resends the full history
+    # on every tool-result round-trip, so the same system prompt appears repeatedly)
+    seen_system: set[str] = set()
+    system_msgs = []
+    for m in messages:
+        if m.get("role") == "system":
+            content = m.get("content", "") or ""
+            if content not in seen_system:
+                seen_system.add(content)
+                system_msgs.append(m)
+
+    # Sliding window: always keep (deduplicated) system messages; limit non-system to last N
+    other_msgs = [m for m in messages if m.get("role") != "system"]
     if CONTEXT_MESSAGES_LIMIT > 0:
         other_msgs = other_msgs[-CONTEXT_MESSAGES_LIMIT:]
     windowed = system_msgs + other_msgs
+
+    # Pre-collect tool_call IDs that already have results in the history.
+    # Stub tool calls from a previous turn may be missing results because the
+    # session ended before they were merged — we synthesize them below.
+    covered_ids: set[str] = {
+        m.get("tool_call_id", "") for m in windowed if m.get("role") == "tool"
+    }
 
     for m in windowed:
         role = m.get("role", "")
@@ -362,45 +335,27 @@ def format_prompt(messages: list, tools: list | None = None) -> str:
 
         if role == "tool":
             parts.append(f"tool_result [{m.get('tool_call_id', '')}]: {content}")
+
         elif role == "assistant" and m.get("tool_calls"):
-            # Preserve tool call context so Qwen understands why tool_results follow
             call_strs = []
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
                 call_strs.append(f"{fn.get('name', '')}({fn.get('arguments', '')})")
+            text_part = f" {content}" if content else ""
             suffix = f" [called: {'; '.join(call_strs)}]" if call_strs else ""
-            parts.append(f"assistant:{suffix}")
+            parts.append(f"assistant:{text_part}{suffix}")
+
+            # Synthesize missing stub results so qwen sees a complete tool-result batch
+            for tc in m["tool_calls"]:
+                tc_id = tc.get("id", "")
+                fn_name = tc.get("function", {}).get("name", "")
+                if tc_id and tc_id not in covered_ids and fn_name in TOOL_STUBS:
+                    parts.append(f"tool_result [{tc_id}]: {TOOL_STUBS[fn_name]}")
+
         else:
             parts.append(f"{role}: {content}")
 
     return "\n".join(parts)
-
-
-def find_session(messages: list) -> "Session | None":
-    # Search from the end — most recent tool calls are at the bottom
-    for m in reversed(messages):
-        if m.get("role") == "tool":
-            s = active_sessions.get(m.get("tool_call_id", ""))
-            if s:
-                return s
-    return None
-
-
-def extract_tool_results(messages: list) -> list:
-    results = []
-    for m in reversed(messages):
-        if m.get("role") == "tool":
-            results.insert(0, {
-                "type": "tool_result",
-                "tool_use_id": m.get("tool_call_id", ""),
-                "content": m.get("content", "") or "",
-                "is_error": False,
-            })
-        elif m.get("role") == "assistant" and m.get("tool_calls"):
-            break
-        else:
-            break
-    return results
 
 
 # ─── Logging helpers ──────────────────────────────────────────────────────────
@@ -429,7 +384,6 @@ async def _iter_session(session: Session, request_id: str, created: int):
     t_start = time.monotonic()
     first_token: float | None = None
     output = ""
-    handed_off = False  # True when we paused for tool_calls — session stays live
 
     try:
         while True:
@@ -486,9 +440,8 @@ async def _iter_session(session: Session, request_id: str, created: int):
                     "choices": [{"delta": {}, "index": 0, "finish_reason": "tool_calls"}],
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
-                handed_off = True
                 yield "data: [DONE]\n\n"
-                return  # pi-agent-core sends next request with tool results
+                return
 
             elif itype == "done":
                 usage = item.get("usage", {})
@@ -505,17 +458,15 @@ async def _iter_session(session: Session, request_id: str, created: int):
                 return
 
     finally:
-        if not handed_off:
-            if session.task and not session.task.done():
-                session.task.cancel()
-            session._unregister()
+        if session.task and not session.task.done():
+            session.task.cancel()
 
 
 # ─── HTTP handler ─────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup():
-    log.warning(f"qwen-bridge v{VERSION} starting, pool={POOL_SIZE} workers, CONTEXT_MESSAGES_LIMIT = {CONTEXT_MESSAGES_LIMIT}")
+    log.warning(f"qwen-bridge v{VERSION} starting, pool={POOL_SIZE} workers, CONTEXT_MESSAGES_LIMIT={CONTEXT_MESSAGES_LIMIT}")
     for i in range(POOL_SIZE):
         w = Worker(wid=i)
         await w.start()
@@ -532,52 +483,11 @@ async def chat(request: Request):
 
     request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
     created = int(time.time())
-
     log_request(request_id, messages, do_stream)
 
-    # ── Tool result continuation ──
-    session = find_session(messages)
-    if session:
-        tool_results = extract_tool_results(messages)
-        if tool_results:
-            log.info(
-                f"[{request_id}] → session-{session.session_id[:8]} "
-                f"(tool results: {len(tool_results)})"
-            )
-            await session.tool_q.put(tool_results)
-
-            if do_stream:
-                return StreamingResponse(
-                    _iter_session(session, request_id, created),
-                    media_type="text/event-stream",
-                )
-
-            output, usage = "", {}
-            while True:
-                item = await asyncio.wait_for(session.out_q.get(), timeout=180.0)
-                if item["type"] == "text":
-                    output += item["text"]
-                elif item["type"] == "tool_calls":
-                    return JSONResponse({
-                        "id": request_id, "object": "chat.completion",
-                        "created": created, "model": "qwen-cli",
-                        "choices": [{
-                            "index": 0,
-                            "message": {"role": "assistant", "content": None, "tool_calls": item["calls"]},
-                            "finish_reason": "tool_calls",
-                        }],
-                    })
-                elif item["type"] == "done":
-                    usage = item.get("usage", {})
-                    break
-            return JSONResponse({
-                "id": request_id, "object": "chat.completion",
-                "created": created, "model": "qwen-cli",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": output}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0), "total_tokens": usage.get("total_tokens", 0)},
-            })
-
-    # ── New conversation ──
+    # Stateless: every request is a fresh conversation.
+    # format_prompt renders the full message history (including past tool calls
+    # and results from openclaw) into a single prompt for qwen.
     prompt = format_prompt(messages, tools=tools)
     worker = await get_worker()
     session = Session(session_id=uuid.uuid4().hex, worker=worker)
