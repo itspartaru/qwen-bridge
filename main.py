@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
-import asyncio, time, uuid, json, logging, os, shlex
+import asyncio, time, uuid, json, logging, os, shlex, re
 from typing import Callable
 
 logging.basicConfig(
@@ -10,7 +10,44 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "1.0.6"
+VERSION = "1.0.7"
+
+# ─── Artifact filter ──────────────────────────────────────────────────────────
+# Qwen Code echoes the format_prompt history format back into its own text
+# output (e.g. "[called: exec({...})]", "tool_result [callXXX]: ...").
+# This filter strips those lines so they don't reach OpenClaw / Telegram.
+
+_ARTIFACT_RE = re.compile(
+    r'^\[called:|^tool_result \[|^assistant:\s+\[called:'
+)
+
+
+class _ArtifactFilter:
+    """Buffer streaming text tokens and suppress Qwen artifact lines."""
+
+    def __init__(self):
+        self._buf = ""
+
+    def feed(self, chunk: str) -> str:
+        self._buf += chunk
+        lines = self._buf.split("\n")
+        self._buf = lines[-1]          # keep the incomplete trailing fragment
+        out = []
+        for line in lines[:-1]:
+            if not _ARTIFACT_RE.match(line):
+                out.append(line)
+        return "\n".join(out) + ("\n" if len(lines) > 1 else "")
+
+    def flush(self) -> str:
+        text = self._buf
+        self._buf = ""
+        return "" if _ARTIFACT_RE.match(text) else text
+
+
+def _strip_artifacts(text: str) -> str:
+    """Remove Qwen artifact lines from a completed text block."""
+    lines = text.splitlines(keepends=True)
+    return "".join(l for l in lines if not _ARTIFACT_RE.match(l))
 CONTEXT_MESSAGES_LIMIT = int(os.getenv("CONTEXT_MESSAGES_LIMIT", "20"))
 
 # ─── Tool mapping: Qwen Code ↔ pi-agent-core ─────────────────────────────────
@@ -384,6 +421,7 @@ async def _iter_session(session: Session, request_id: str, created: int):
     t_start = time.monotonic()
     first_token: float | None = None
     output = ""
+    af = _ArtifactFilter()
 
     try:
         while True:
@@ -396,17 +434,18 @@ async def _iter_session(session: Session, request_id: str, created: int):
             itype = item["type"]
 
             if itype == "text":
-                text = item["text"]
-                output += text
-                if first_token is None:
-                    first_token = time.monotonic() - t_start
-                    log.info(f"[{request_id}] first token in {first_token:.2f}s")
-                payload = {
-                    "id": request_id, "object": "chat.completion.chunk",
-                    "created": created, "model": "qwen-cli",
-                    "choices": [{"delta": {"content": text}, "index": 0, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
+                clean = af.feed(item["text"])
+                output += clean
+                if clean:
+                    if first_token is None:
+                        first_token = time.monotonic() - t_start
+                        log.info(f"[{request_id}] first token in {first_token:.2f}s")
+                    payload = {
+                        "id": request_id, "object": "chat.completion.chunk",
+                        "created": created, "model": "qwen-cli",
+                        "choices": [{"delta": {"content": clean}, "index": 0, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
 
             elif itype == "tool_calls":
                 calls = item["calls"]
@@ -444,6 +483,16 @@ async def _iter_session(session: Session, request_id: str, created: int):
                 return
 
             elif itype == "done":
+                # Flush any buffered fragment from the artifact filter
+                tail = af.flush()
+                if tail:
+                    output += tail
+                    payload = {
+                        "id": request_id, "object": "chat.completion.chunk",
+                        "created": created, "model": "qwen-cli",
+                        "choices": [{"delta": {"content": tail}, "index": 0, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
                 usage = item.get("usage", {})
                 elapsed = time.monotonic() - t_start
                 tokens = f"in={usage.get('input_tokens','?')} out={usage.get('output_tokens','?')}"
@@ -519,6 +568,7 @@ async def chat(request: Request):
             usage = item.get("usage", {})
             break
 
+    output = _strip_artifacts(output)
     return JSONResponse({
         "id": request_id, "object": "chat.completion",
         "created": created, "model": "qwen-cli",
