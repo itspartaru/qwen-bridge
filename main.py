@@ -10,7 +10,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "1.0.8"
+VERSION = "1.0.9"
 
 # ─── Artifact filter ──────────────────────────────────────────────────────────
 # Qwen Code echoes the format_prompt history format back into its own text
@@ -18,7 +18,7 @@ VERSION = "1.0.8"
 # This filter strips those lines so they don't reach OpenClaw / Telegram.
 
 _ARTIFACT_RE = re.compile(
-    r'^\[called:|^tool_result \[|^assistant:\s+\[called:'
+    r'^\[called:|^tool_result \[|^assistant:\s+\[called:|^<tool_call:|^<tool_result>'
 )
 
 
@@ -321,7 +321,10 @@ async def get_worker() -> Worker:
 # ─── Message formatting ───────────────────────────────────────────────────────
 
 def format_prompt(messages: list, tools: list | None = None) -> str:
-    parts = []
+    parts = [
+        "[HISTORY — do not reproduce <tool_call:>, <tool_result>, or [called:] "
+        "tags in your response. Reply naturally as the assistant.]"
+    ]
 
     # Inject pi-agent-core tool definitions so Qwen Code knows about them
     if tools:
