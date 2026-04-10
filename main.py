@@ -10,7 +10,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("qwen-bridge")
 
-VERSION = "1.0.7"
+VERSION = "1.0.8"
 
 # ─── Artifact filter ──────────────────────────────────────────────────────────
 # Qwen Code echoes the format_prompt history format back into its own text
@@ -371,23 +371,24 @@ def format_prompt(messages: list, tools: list | None = None) -> str:
             content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
 
         if role == "tool":
-            parts.append(f"tool_result [{m.get('tool_call_id', '')}]: {content}")
+            # Neutral XML wrapper — avoids teaching the model to output "tool_result [id]:" text
+            parts.append(f"<tool_result>{content}</tool_result>")
 
         elif role == "assistant" and m.get("tool_calls"):
-            call_strs = []
+            # Show text content separately; tool calls as XML so the model
+            # doesn't learn to reproduce "[called: name({...})]" in its own output
+            if content:
+                parts.append(f"assistant: {content}")
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
-                call_strs.append(f"{fn.get('name', '')}({fn.get('arguments', '')})")
-            text_part = f" {content}" if content else ""
-            suffix = f" [called: {'; '.join(call_strs)}]" if call_strs else ""
-            parts.append(f"assistant:{text_part}{suffix}")
+                parts.append(f"<tool_call:{fn.get('name', '')}>{fn.get('arguments', '')}</tool_call:{fn.get('name', '')}>")
 
             # Synthesize missing stub results so qwen sees a complete tool-result batch
             for tc in m["tool_calls"]:
                 tc_id = tc.get("id", "")
                 fn_name = tc.get("function", {}).get("name", "")
                 if tc_id and tc_id not in covered_ids and fn_name in TOOL_STUBS:
-                    parts.append(f"tool_result [{tc_id}]: {TOOL_STUBS[fn_name]}")
+                    parts.append(f"<tool_result>{TOOL_STUBS[fn_name]}</tool_result>")
 
         else:
             parts.append(f"{role}: {content}")
